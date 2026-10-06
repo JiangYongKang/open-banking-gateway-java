@@ -35,6 +35,7 @@ public class ConsentService {
     }
 
     public Consent create(CallerContext caller, ConsentRequest request) {
+        requireManage(caller, "create");
         validateCreateRequest(request);
         if (!caller.scopes().containsAll(request.getScopes())) {
             log.info("consent-create partner={} reason=scope_not_granted requested={} tokenScopes={}",
@@ -69,6 +70,57 @@ public class ConsentService {
 
     public Consent revoke(CallerContext caller, String consentId) {
         return transition(caller, consentId, ConsentStatus.REVOKED, "revoke");
+    }
+
+    /**
+     * 只读列表：仅返回本合作方名下同意书，按创建时间排序。
+     * 只读范围（CONSENTS_READ）可用；跨合作方数据天然不可见。
+     */
+    public java.util.List<Consent> list(CallerContext caller) {
+        requireRead(caller, "list");
+        return consentRepository.findAll().stream()
+                .filter(c -> c.partnerId().equals(caller.partnerId()))
+                .sorted(java.util.Comparator.comparing(Consent::createdAt))
+                .toList();
+    }
+
+    /**
+     * 只读详情：与变更操作共享同一归属语义——不存在与跨合作方一律 NOT_FOUND。
+     */
+    public Consent getDetail(CallerContext caller, String consentId) {
+        requireRead(caller, "detail");
+        return getOwned(caller, consentId);
+    }
+
+    /**
+     * 一致性快照：在同意书对象锁内一次性读出状态、版本与可用性，
+     * 与状态迁移互斥，读到的必然是某次成功迁移之前或之后的完整状态。
+     */
+    public com.github.highcumontoa.openbankinggatewayjava.domain.ConsentSnapshot snapshot(Consent consent) {
+        synchronized (consent) {
+            return new com.github.highcumontoa.openbankinggatewayjava.domain.ConsentSnapshot(
+                    consent.id(), consent.partnerId(), consent.accountIds(), consent.scopes(),
+                    consent.createdAt(), consent.expiresAt(), consent.status(), consent.version(),
+                    consent.updatedAt(), effectiveStatus(consent) == ConsentStatus.AUTHORIZED);
+        }
+    }
+
+    private void requireRead(CallerContext caller, String action) {
+        if (!caller.canReadConsents()) {
+            log.info("consent-{} partner={} reason=read_scope_missing tokenScopes={}",
+                    action, caller.partnerId(), caller.scopes());
+            throw new GatewayException(ErrorCode.INSUFFICIENT_SCOPE,
+                    "token requires scope CONSENTS_READ or CONSENTS_MANAGE");
+        }
+    }
+
+    private void requireManage(CallerContext caller, String action) {
+        if (!caller.canManageConsents()) {
+            log.info("consent-{} partner={} reason=manage_scope_missing tokenScopes={}",
+                    action, caller.partnerId(), caller.scopes());
+            throw new GatewayException(ErrorCode.INSUFFICIENT_SCOPE,
+                    "token requires scope CONSENTS_MANAGE");
+        }
     }
 
     /**
@@ -131,6 +183,7 @@ public class ConsentService {
     }
 
     private Consent transition(CallerContext caller, String consentId, ConsentStatus target, String action) {
+        requireManage(caller, action);
         Consent consent = getOwned(caller, consentId);
         ConsentStatus current = effectiveStatus(consent);
         if (!allowed(current, target)) {
@@ -152,11 +205,12 @@ public class ConsentService {
                 throw new GatewayException(ErrorCode.INVALID_CONSENT_STATE,
                         "illegal transition after recheck: " + rechecked + " -> " + target);
             }
-            consent.setStatus(target);
+            // 成功迁移：版本单调递增、变更时间推进；读取侧只能看到迁移前或后的完整状态
+            consent.markTransition(target, Instant.now());
             consentRepository.save(consent);
+            log.info("state-transition consentId={} partner={} {} : {} -> {} ACCEPTED version={}",
+                    consentId, caller.partnerId(), action, rechecked, target, consent.version());
         }
-        log.info("state-transition consentId={} partner={} {} : {} -> {} ACCEPTED",
-                consentId, caller.partnerId(), action, current, target);
         return consent;
     }
 

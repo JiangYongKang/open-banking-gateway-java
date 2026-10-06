@@ -81,26 +81,80 @@ public class PaymentService {
                     throw new GatewayException(ErrorCode.IDEMPOTENCY_CONFLICT,
                             "idempotency key was used with a different request payload");
                 }
+                if (record.outcome() == IdempotencyRecord.Outcome.REJECTED) {
+                    // 失败同样原样回放：不重新执行，返回当时那次判定的可区分原因
+                    log.info("idempotency key={} partner={} reason=replay_rejection code={}",
+                            idempotencyKey, caller.partnerId(), record.rejectReason().code());
+                    throw new GatewayException(record.rejectReason(), record.rejectMessage());
+                }
                 log.info("idempotency key={} partner={} reason=replay paymentId={}",
                         idempotencyKey, caller.partnerId(), record.payment().id());
                 return record.payment();
             }
 
-            // 2) 限流（在幂等占位内、记账前；被限流不产生任何效果）
+            // 2) 限流（在幂等占位内、记账前；被限流不动账，但判定结果落幂等记录可回查）
             if (!rateLimiter.tryAcquire(caller.partnerId())) {
                 log.info("payment-reject key={} partner={} reason=rate_limited",
                         idempotencyKey, caller.partnerId());
+                recordRejection(caller, idempotencyKey, fingerprint,
+                        ErrorCode.RATE_LIMITED, "payment rate limit exceeded for partner");
                 throw new GatewayException(ErrorCode.RATE_LIMITED, "payment rate limit exceeded for partner");
             }
 
-            // 3) 执行业务；成功后落幂等记录。业务失败不写幂等表，允许同键重试修正。
-            Payment payment = execute(caller, idempotencyKey, request);
-            idempotencyStore.put(new IdempotencyRecord(
-                    caller.partnerId(), idempotencyKey, fingerprint, payment));
-            log.info("idempotency key={} partner={} reason=stored paymentId={}",
-                    idempotencyKey, caller.partnerId(), payment.id());
-            return payment;
+            // 3) 执行业务。成功与业务拒绝都落幂等记录：同键同报文回放首次判定，
+            //    同键异报文冲突，不能靠改报文绕过已发生的失败。
+            try {
+                Payment payment = execute(caller, idempotencyKey, request);
+                idempotencyStore.put(IdempotencyRecord.completed(
+                        caller.partnerId(), idempotencyKey, fingerprint, payment));
+                log.info("idempotency key={} partner={} reason=stored paymentId={}",
+                        idempotencyKey, caller.partnerId(), payment.id());
+                return payment;
+            } catch (GatewayException ex) {
+                if (isBusinessRejection(ex.errorCode())) {
+                    recordRejection(caller, idempotencyKey, fingerprint, ex.errorCode(), ex.getMessage());
+                }
+                throw ex;
+            }
         }
+    }
+
+    /**
+     * 按幂等键回查首次提交结果（成功或业务拒绝）。键按合作方隔离，
+     * 查不到（从未提交/已超保留期被清理）一律 NOT_FOUND。
+     */
+    public IdempotencyRecord lookup(CallerContext caller, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new GatewayException(ErrorCode.VALIDATION_ERROR, "idempotencyKey is required");
+        }
+        return idempotencyStore.find(caller.partnerId(), idempotencyKey)
+                .orElseThrow(() -> {
+                    log.info("payment-lookup key={} partner={} reason=not_found",
+                            idempotencyKey, caller.partnerId());
+                    return new GatewayException(ErrorCode.NOT_FOUND,
+                            "no payment result for idempotency key: " + idempotencyKey);
+                });
+    }
+
+    /**
+     * 业务拒绝（可回查的失败判定）：余额不足、授权不可用、限流等。
+     * 校验错误（报文本身非法）与内部错误（记账失败可重试）不落记录。
+     */
+    private boolean isBusinessRejection(ErrorCode code) {
+        return switch (code) {
+            case INSUFFICIENT_FUNDS, RATE_LIMITED, NOT_FOUND, ACCOUNT_NOT_FOUND,
+                 CONSENT_EXPIRED, CONSENT_REVOKED, INVALID_CONSENT_STATE,
+                 CONSENT_SCOPE_MISMATCH, ACCOUNT_NOT_IN_CONSENT -> true;
+            default -> false;
+        };
+    }
+
+    private void recordRejection(CallerContext caller, String idempotencyKey, String fingerprint,
+                                 ErrorCode reason, String message) {
+        idempotencyStore.put(IdempotencyRecord.rejected(
+                caller.partnerId(), idempotencyKey, fingerprint, reason, message));
+        log.info("idempotency key={} partner={} reason=stored_rejection code={}",
+                idempotencyKey, caller.partnerId(), reason.code());
     }
 
     private Payment execute(CallerContext caller, String idempotencyKey, PaymentRequest request) {

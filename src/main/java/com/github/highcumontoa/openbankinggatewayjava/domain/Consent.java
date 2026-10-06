@@ -17,6 +17,8 @@ public class Consent {
     private final Instant expiresAt;
 
     private ConsentStatus status;
+    private long version;
+    private Instant updatedAt;
 
     public Consent(String partnerId, Set<String> accountIds, Set<Scope> scopes, Instant expiresAt) {
         this(UUID.randomUUID().toString(), partnerId, accountIds, scopes, Instant.now(), expiresAt, ConsentStatus.CREATED);
@@ -31,6 +33,8 @@ public class Consent {
         this.createdAt = createdAt;
         this.expiresAt = expiresAt;
         this.status = status;
+        this.version = 0;
+        this.updatedAt = createdAt;
     }
 
     public String id() {
@@ -63,5 +67,28 @@ public class Consent {
 
     public void setStatus(ConsentStatus status) {
         this.status = status;
+    }
+
+    /**
+     * 对外次序信息：每次成功状态迁移单调递增，只增不减。
+     */
+    public long version() {
+        return version;
+    }
+
+    /**
+     * 最近一次成功变更（含创建）的时间。
+     */
+    public Instant updatedAt() {
+        return updatedAt;
+    }
+
+    /**
+     * 记录一次成功迁移：版本 +1、变更时间推进。须在同意书对象锁内调用。
+     */
+    public void markTransition(ConsentStatus target, Instant at) {
+        this.status = target;
+        this.version++;
+        this.updatedAt = at;
     }
 }
