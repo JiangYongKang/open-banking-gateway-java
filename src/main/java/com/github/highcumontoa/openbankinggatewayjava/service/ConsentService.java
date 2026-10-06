@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -56,19 +57,35 @@ public class ConsentService {
     }
 
     public Consent authorize(CallerContext caller, String consentId) {
-        return transition(caller, consentId, ConsentStatus.AUTHORIZED, "authorize");
+        return authorize(caller, consentId, null);
+    }
+
+    public Consent authorize(CallerContext caller, String consentId, Long expectedVersion) {
+        return transition(caller, consentId, ConsentStatus.AUTHORIZED, "authorize", expectedVersion);
     }
 
     public Consent suspend(CallerContext caller, String consentId) {
-        return transition(caller, consentId, ConsentStatus.SUSPENDED, "suspend");
+        return suspend(caller, consentId, null);
+    }
+
+    public Consent suspend(CallerContext caller, String consentId, Long expectedVersion) {
+        return transition(caller, consentId, ConsentStatus.SUSPENDED, "suspend", expectedVersion);
     }
 
     public Consent resume(CallerContext caller, String consentId) {
-        return transition(caller, consentId, ConsentStatus.AUTHORIZED, "resume");
+        return resume(caller, consentId, null);
+    }
+
+    public Consent resume(CallerContext caller, String consentId, Long expectedVersion) {
+        return transition(caller, consentId, ConsentStatus.AUTHORIZED, "resume", expectedVersion);
     }
 
     public Consent revoke(CallerContext caller, String consentId) {
-        return transition(caller, consentId, ConsentStatus.REVOKED, "revoke");
+        return revoke(caller, consentId, null);
+    }
+
+    public Consent revoke(CallerContext caller, String consentId, Long expectedVersion) {
+        return transition(caller, consentId, ConsentStatus.REVOKED, "revoke", expectedVersion);
     }
 
     /**
@@ -112,6 +129,18 @@ public class ConsentService {
     }
 
     /**
+     * 本合作方名下同意书列表（只读视图）。按 id 排序保证输出稳定。
+     */
+    public List<Consent> listOwned(CallerContext caller) {
+        List<Consent> owned = consentRepository.findAll().stream()
+                .filter(c -> c.partnerId().equals(caller.partnerId()))
+                .sorted(java.util.Comparator.comparing(Consent::id))
+                .toList();
+        log.info("consent-list partner={} count={}", caller.partnerId(), owned.size());
+        return owned;
+    }
+
+    /**
      * 归属读取：不存在 / 归属他人一律 NOT_FOUND（对外不区分），内部 reason 可区分。
      */
     public Consent getOwned(CallerContext caller, String consentId) {
@@ -130,7 +159,8 @@ public class ConsentService {
         return consent;
     }
 
-    private Consent transition(CallerContext caller, String consentId, ConsentStatus target, String action) {
+    private Consent transition(CallerContext caller, String consentId, ConsentStatus target,
+                               String action, Long expectedVersion) {
         Consent consent = getOwned(caller, consentId);
         ConsentStatus current = effectiveStatus(consent);
         if (!allowed(current, target)) {
@@ -152,8 +182,18 @@ public class ConsentService {
                 throw new GatewayException(ErrorCode.INVALID_CONSENT_STATE,
                         "illegal transition after recheck: " + rechecked + " -> " + target);
             }
-            consent.setStatus(target);
+            // 乐观并发：调用方携带期望版本时，版本不一致即冲突，绝不互相覆盖
+            if (expectedVersion != null && expectedVersion != consent.version()) {
+                log.info("state-transition consentId={} partner={} {} REJECTED reason=version_conflict expected={} actual={}",
+                        consentId, caller.partnerId(), action, expectedVersion, consent.version());
+                throw new GatewayException(ErrorCode.CONSENT_VERSION_CONFLICT,
+                        "consent version conflict: expected " + expectedVersion
+                                + " but current is " + consent.version());
+            }
+            consent.markTransition(target, Instant.now());
             consentRepository.save(consent);
+            log.info("state-transition consentId={} partner={} {} : {} -> {} version={} APPLIED",
+                    consentId, caller.partnerId(), action, rechecked, target, consent.version());
         }
         log.info("state-transition consentId={} partner={} {} : {} -> {} ACCEPTED",
                 consentId, caller.partnerId(), action, current, target);
@@ -161,13 +201,7 @@ public class ConsentService {
     }
 
     private ConsentStatus effectiveStatus(Consent consent) {
-        if (consent.status() == ConsentStatus.REVOKED) {
-            return ConsentStatus.REVOKED;
-        }
-        if (!consent.expiresAt().isAfter(Instant.now())) {
-            return ConsentStatus.EXPIRED;
-        }
-        return consent.status();
+        return consent.effectiveStatus();
     }
 
     private boolean allowed(ConsentStatus from, ConsentStatus to) {

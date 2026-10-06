@@ -19,6 +19,7 @@ public enum ErrorCode {
     CONSENT_SCOPE_MISMATCH(HttpStatus.FORBIDDEN, "consent_scope_mismatch"),
     ACCOUNT_NOT_IN_CONSENT(HttpStatus.FORBIDDEN, "account_not_in_consent"),
     IDEMPOTENCY_CONFLICT(HttpStatus.CONFLICT, "idempotency_conflict"),
+    CONSENT_VERSION_CONFLICT(HttpStatus.CONFLICT, "consent_version_conflict"),
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS, "rate_limited"),
     VALIDATION_ERROR(HttpStatus.BAD_REQUEST, "validation_error"),
     INSUFFICIENT_FUNDS(HttpStatus.UNPROCESSABLE_ENTITY, "insufficient_funds"),

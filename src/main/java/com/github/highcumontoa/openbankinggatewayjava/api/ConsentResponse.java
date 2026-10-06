@@ -15,16 +15,35 @@ public class ConsentResponse {
     private Set<Scope> scopes;
     private Instant createdAt;
     private Instant expiresAt;
+    // 新增字段（纯追加，旧调用方不受影响）：对外次序信息与可用性
+    private long version;
+    private Instant lastModifiedAt;
+    private boolean usable;
 
     public static ConsentResponse from(Consent c) {
         ConsentResponse r = new ConsentResponse();
         r.consentId = c.id();
-        r.status = c.status().name();
+        r.status = c.effectiveStatus().name();
         r.accountIds = c.accountIds();
         r.scopes = c.scopes();
         r.createdAt = c.createdAt();
         r.expiresAt = c.expiresAt();
+        r.version = c.version();
+        r.lastModifiedAt = c.lastModifiedAt();
+        r.usable = c.usable();
         return r;
+    }
+
+    public long getVersion() {
+        return version;
+    }
+
+    public Instant getLastModifiedAt() {
+        return lastModifiedAt;
+    }
+
+    public boolean isUsable() {
+        return usable;
     }
 
     public String getConsentId() {

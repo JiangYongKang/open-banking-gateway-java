@@ -42,7 +42,7 @@ public final class TestFixtures {
         AccountRepository accounts = new InMemoryAccountRepository();
         PaymentRepository payments = new InMemoryPaymentRepository();
         LedgerRepository ledger = new InMemoryLedgerRepository();
-        IdempotencyStore idempotency = new IdempotencyStore();
+        IdempotencyStore idempotency = new IdempotencyStore(properties);
         PartnerRateLimiter limiter = new PartnerRateLimiter(properties);
         ConsentService consentService = new ConsentService(consents, properties);
         PaymentService paymentService = new PaymentService(consentService, accounts, payments,

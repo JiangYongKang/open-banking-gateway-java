@@ -33,7 +33,10 @@ import java.util.UUID;
  *   <li>同 (partner, idempotencyKey) 在键锁内串行：同键同报文回放、同键异报文冲突；</li>
  *   <li>同意书对象锁串行化"支付与撤销"，二者不会半生效；</li>
  *   <li>余额校验/扣减在付款账户锁内完成，不足额失败不动账；</li>
- *   <li>限流/校验失败均在记账之前返回，任何失败路径都不改变余额。</li>
+ *   <li>限流/校验失败均在记账之前返回，任何失败路径都不改变余额；</li>
+ *   <li>业务拒绝（余额不足/同意书不可用/限流等）与成功一样落幂等记录：
+ *       同键同报文回放当时的拒绝原因，同键异报文判冲突，绝不重新执行；
+ *       记录有保留窗口，超窗可清理，不影响已生效支付与账务。</li>
  * </ol>
  */
 @Service
@@ -81,26 +84,68 @@ public class PaymentService {
                     throw new GatewayException(ErrorCode.IDEMPOTENCY_CONFLICT,
                             "idempotency key was used with a different request payload");
                 }
-                log.info("idempotency key={} partner={} reason=replay paymentId={}",
-                        idempotencyKey, caller.partnerId(), record.payment().id());
-                return record.payment();
+                return replay(record, idempotencyKey, caller);
             }
 
-            // 2) 限流（在幂等占位内、记账前；被限流不产生任何效果）
+            // 2) 限流（在幂等占位内、记账前；被限流不产生任何账务效果，但判定结果落回查记录）
             if (!rateLimiter.tryAcquire(caller.partnerId())) {
                 log.info("payment-reject key={} partner={} reason=rate_limited",
                         idempotencyKey, caller.partnerId());
-                throw new GatewayException(ErrorCode.RATE_LIMITED, "payment rate limit exceeded for partner");
+                GatewayException ex = new GatewayException(ErrorCode.RATE_LIMITED,
+                        "payment rate limit exceeded for partner");
+                idempotencyStore.put(IdempotencyRecord.rejected(
+                        caller.partnerId(), idempotencyKey, fingerprint,
+                        ex.errorCode(), ex.getMessage()));
+                log.info("idempotency key={} partner={} reason=stored-rejection code={}",
+                        idempotencyKey, caller.partnerId(), ex.errorCode().code());
+                throw ex;
             }
 
-            // 3) 执行业务；成功后落幂等记录。业务失败不写幂等表，允许同键重试修正。
-            Payment payment = execute(caller, idempotencyKey, request);
-            idempotencyStore.put(new IdempotencyRecord(
-                    caller.partnerId(), idempotencyKey, fingerprint, payment));
-            log.info("idempotency key={} partner={} reason=stored paymentId={}",
-                    idempotencyKey, caller.partnerId(), payment.id());
-            return payment;
+            // 3) 执行业务；成功与业务拒绝都落幂等记录，保证可按键回查且不重新执行。
+            try {
+                Payment payment = execute(caller, idempotencyKey, request);
+                idempotencyStore.put(IdempotencyRecord.completed(
+                        caller.partnerId(), idempotencyKey, fingerprint, payment));
+                log.info("idempotency key={} partner={} reason=stored paymentId={}",
+                        idempotencyKey, caller.partnerId(), payment.id());
+                return payment;
+            } catch (GatewayException ex) {
+                idempotencyStore.put(IdempotencyRecord.rejected(
+                        caller.partnerId(), idempotencyKey, fingerprint,
+                        ex.errorCode(), ex.getMessage()));
+                log.info("idempotency key={} partner={} reason=stored-rejection code={}",
+                        idempotencyKey, caller.partnerId(), ex.errorCode().code());
+                throw ex;
+            }
         }
+    }
+
+    /**
+     * 按幂等键回查提交结果（成功与业务拒绝都可查）。
+     * 无记录或记录已超保留窗口时，与"键不存在"同构返回 NOT_FOUND。
+     */
+    public IdempotencyRecord lookup(CallerContext caller, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new GatewayException(ErrorCode.VALIDATION_ERROR, "idempotency key is required");
+        }
+        return idempotencyStore.find(caller.partnerId(), idempotencyKey)
+                .orElseThrow(() -> {
+                    log.info("payment-lookup key={} partner={} reason=not_found",
+                            idempotencyKey, caller.partnerId());
+                    return new GatewayException(ErrorCode.NOT_FOUND,
+                            "payment result not found for idempotency key: " + idempotencyKey);
+                });
+    }
+
+    private Payment replay(IdempotencyRecord record, String idempotencyKey, CallerContext caller) {
+        if (record.outcome() == IdempotencyRecord.Outcome.REJECTED) {
+            log.info("idempotency key={} partner={} reason=replay-rejection code={}",
+                    idempotencyKey, caller.partnerId(), record.rejectionCode().code());
+            throw new GatewayException(record.rejectionCode(), record.rejectionMessage());
+        }
+        log.info("idempotency key={} partner={} reason=replay paymentId={}",
+                idempotencyKey, caller.partnerId(), record.payment().id());
+        return record.payment();
     }
 
     private Payment execute(CallerContext caller, String idempotencyKey, PaymentRequest request) {

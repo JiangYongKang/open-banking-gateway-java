@@ -17,7 +17,7 @@ import java.util.Set;
  * 本地演示数据（无外部依赖）：
  * <ul>
  *   <li>账户 acct-1001 / acct-1002 / acct-2001，初始余额合计 100000 CNY；</li>
- *   <li>合作方 partner-alpha（双范围）、partner-beta（仅账户查询）；</li>
+ *   <li>合作方 partner-alpha（账户+支付+同意书管理）、partner-beta（账户查询+同意书只读）；</li>
  *   <li>启动日志直接打印演示令牌，可复制使用。</li>
  * </ul>
  */
@@ -44,9 +44,10 @@ public class DataInitializer implements CommandLineRunner {
         accountRepository.save(new Account("acct-2001", "Carol Wang", new BigDecimal("0.00")));
 
         TokenService.TokenRecord alpha = tokenService.issue(PARTNER_ALPHA,
-                Set.of(Scope.ACCOUNTS_READ, Scope.PAYMENTS_INITIATE), Duration.ofHours(8));
+                Set.of(Scope.ACCOUNTS_READ, Scope.PAYMENTS_INITIATE,
+                        Scope.CONSENTS_READ, Scope.CONSENTS_MANAGE), Duration.ofHours(8));
         TokenService.TokenRecord beta = tokenService.issue(PARTNER_BETA,
-                Set.of(Scope.ACCOUNTS_READ), Duration.ofHours(8));
+                Set.of(Scope.ACCOUNTS_READ, Scope.CONSENTS_READ), Duration.ofHours(8));
 
         log.info("==== 本地演示令牌（8h 有效）====");
         log.info("{} scopes={} token={}", PARTNER_ALPHA, alpha.scopes(), alpha.token());
